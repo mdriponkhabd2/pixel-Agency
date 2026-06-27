@@ -77,8 +77,15 @@ app.use(async (req, res, next) => {
           console.error("Failed to sync from/to connected SQL DB on warmup, falling back to local/Firestore:", sqlErr);
         }
       } else if (process.env.VERCEL) {
-        console.log("Vercel execution context: Prewarming persistent db.json from Firestore...");
-        await loadDbFromFirestore();
+        console.log("Vercel execution context: Prewarming persistent db.json from Firestore with 1.5s timeout...");
+        try {
+          await Promise.race([
+            loadDbFromFirestore(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("Firestore prewarm timed out")), 1500))
+          ]);
+        } catch (warmupErr: any) {
+          console.warn("Firestore prewarm bypassed or timed out, falling back to local files:", warmupErr.message);
+        }
       }
       dbLoaded = true;
     } catch (err) {
@@ -838,6 +845,17 @@ try {
 
 async function loadDbFromFirestore() {
   try {
+    const localDbPath = path.join(process.cwd(), "db.json");
+    let initialSeed = DEFAULT_DB;
+    if (fs.existsSync(localDbPath)) {
+      try {
+        initialSeed = JSON.parse(fs.readFileSync(localDbPath, "utf-8"));
+        console.log("Loaded local db.json customized template for initial Firestore seeding.");
+      } catch (err) {
+        console.error("Failed parsing local db.json template for seeding:", err);
+      }
+    }
+
     if (isClientSdk && clientDbInstance) {
       console.log("Loading database from Cloud Firestore (via Client SDK)...");
       const docRef = clientDoc(clientDbInstance, "app_state", "db");
@@ -850,10 +868,10 @@ async function loadDbFromFirestore() {
           return cloudData;
         }
       }
-      console.log("No database found in Firestore. Seeding with DEFAULT_DB empty cache...");
-      await clientSetDoc(docRef, DEFAULT_DB);
-      fs.writeFileSync(DB_FILE, JSON.stringify(DEFAULT_DB, null, 2));
-      return DEFAULT_DB;
+      console.log("No database found in Firestore. Seeding with local template/DEFAULT_DB...");
+      await clientSetDoc(docRef, initialSeed);
+      fs.writeFileSync(DB_FILE, JSON.stringify(initialSeed, null, 2));
+      return initialSeed;
     } else if (firestoreDb) {
       console.log("Loading database from Cloud Firestore (via Admin SDK)...");
       const docRef = firestoreDb.collection("app_state").doc("db");
@@ -866,8 +884,8 @@ async function loadDbFromFirestore() {
           return cloudData;
         }
       }
-      console.log("No database found in Firestore. Seeding Firestore with DEFAULT_DB...");
-      await docRef.set(DEFAULT_DB);
+      console.log("No database found in Firestore. Seeding Firestore with local template/DEFAULT_DB...");
+      await docRef.set(initialSeed);
     }
   } catch (err) {
     console.error("Failed to load/seed database from Cloud Firestore:", err);
@@ -1442,8 +1460,22 @@ function readDb() {
   try {
     let db;
     if (!fs.existsSync(DB_FILE)) {
-      db = DEFAULT_DB;
-      fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+      const fallbackLocalPath = path.join(process.cwd(), "db.json");
+      if (process.env.VERCEL && fs.existsSync(fallbackLocalPath)) {
+        try {
+          const content = fs.readFileSync(fallbackLocalPath, "utf-8");
+          db = JSON.parse(content);
+          fs.writeFileSync(DB_FILE, content);
+          console.log("Initialized /tmp/db.json on Vercel from local db.json template.");
+        } catch (copyErr) {
+          console.error("Failed to copy local db.json to /tmp/db.json:", copyErr);
+          db = JSON.parse(JSON.stringify(DEFAULT_DB));
+          fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+        }
+      } else {
+        db = JSON.parse(JSON.stringify(DEFAULT_DB));
+        fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+      }
     } else {
       const data = fs.readFileSync(DB_FILE, "utf-8");
       db = JSON.parse(data);

@@ -9,6 +9,14 @@ import AdminPanel from "./components/AdminPanel";
 import ContactForm from "./components/ContactForm";
 
 import { Service, ServicePackage, PortfolioItem, Testimonial, FAQ, Order, User, WebsiteSettings, ContactMessage } from "./types";
+import {
+  STATIC_SERVICES,
+  STATIC_PACKAGES,
+  STATIC_PORTFOLIO,
+  STATIC_TESTIMONIALS,
+  STATIC_FAQS,
+  STATIC_SETTINGS
+} from "./staticData";
 
 export default function App() {
   // Navigation Route state
@@ -18,19 +26,12 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
 
   // Core Data models loaded dynamically from server
-  const [services, setServices] = useState<Service[]>([]);
-  const [packages, setPackages] = useState<ServicePackage[]>([]);
-  const [portfolio, setPortfolio] = useState<PortfolioItem[]>([]);
-  const [testimonials, setTestimonials] = useState<Testimonial[]>([]);
-  const [faqs, setFaqs] = useState<FAQ[]>([]);
-  const [settings, setSettings] = useState<WebsiteSettings>({
-    address: "Jamtoli, Austagram, Kishoreganj-2380",
-    whatsapp: "01837679963",
-    liveChatEnabled: true,
-    seoTitle: "Pixel Agency - Elite Digital Services",
-    seoKeywords: "design, editing, dev",
-    seoDescription: "World-class digital assets."
-  });
+  const [services, setServices] = useState<Service[]>(STATIC_SERVICES);
+  const [packages, setPackages] = useState<ServicePackage[]>(STATIC_PACKAGES);
+  const [portfolio, setPortfolio] = useState<PortfolioItem[]>(STATIC_PORTFOLIO);
+  const [testimonials, setTestimonials] = useState<Testimonial[]>(STATIC_TESTIMONIALS);
+  const [faqs, setFaqs] = useState<FAQ[]>(STATIC_FAQS);
+  const [settings, setSettings] = useState<WebsiteSettings>(STATIC_SETTINGS);
 
   // Admin exclusive states
   const [orders, setOrders] = useState<Order[]>([]);
@@ -71,12 +72,12 @@ export default function App() {
       if (!resp.ok) throw new Error("Public data offline");
       const data = await resp.json();
       
-      setServices(data.services || []);
-      setPackages(data.packages || []);
-      setPortfolio(data.portfolio || []);
-      setTestimonials(data.testimonials || []);
-      setFaqs(data.faqs || []);
-      setSettings(data.settings || settings);
+      setServices(data.services?.length ? data.services : STATIC_SERVICES);
+      setPackages(data.packages?.length ? data.packages : STATIC_PACKAGES);
+      setPortfolio(data.portfolio?.length ? data.portfolio : STATIC_PORTFOLIO);
+      setTestimonials(data.testimonials?.length ? data.testimonials : STATIC_TESTIMONIALS);
+      setFaqs(data.faqs?.length ? data.faqs : STATIC_FAQS);
+      setSettings(data.settings || STATIC_SETTINGS);
     } catch (err) {
       console.warn("Express server initial bootstrap pending, loading design mock variables.");
     } finally {
@@ -168,15 +169,18 @@ export default function App() {
       {/* 2. Primary Layout switch viewport */}
       <main className="flex-grow">
         
-        {/* Dynamic Route: Home Overview */}
-        {currentRoute === "home" && (
+        {/* Dynamic Route: Home Overview or Service Slugs */}
+        {(currentRoute === "home" || activeService) && (
           <MainLanding
             services={services}
             testimonials={testimonials}
             portfolio={portfolio}
             packages={packages}
+            faqs={faqs}
             onNavigate={handleNavigate}
             settings={settings}
+            activeServiceSlug={activeService?.slug || null}
+            currentUser={currentUser}
           />
         )}
 
@@ -188,8 +192,11 @@ export default function App() {
               testimonials={testimonials}
               portfolio={portfolio}
               packages={packages}
+              faqs={faqs}
               onNavigate={handleNavigate}
               settings={settings}
+              activeServiceSlug={null}
+              currentUser={currentUser}
             />
           </div>
         )}
@@ -258,20 +265,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Dynamic Service slugs route catcher */}
-        {activeService && (
-          <div className="pt-16">
-            <ServicePage
-              service={activeService}
-              packages={packages.filter((p) => p.serviceId === activeService.id)}
-              portfolio={portfolio.filter((p) => p.serviceId === activeService.id)}
-              faqs={faqs.filter((f) => f.serviceId === activeService.id || !f.serviceId)}
-              currentUser={currentUser}
-              onNavigate={handleNavigate}
-              settings={settings}
-            />
-          </div>
-        )}
+
 
         {/* Security Signin / Signup viewport */}
         {(currentRoute === "login" || currentRoute === "signup" || currentRoute === "admin-login") && (
