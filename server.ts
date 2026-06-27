@@ -6,6 +6,8 @@ import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import { initializeApp as initAdminApp, getApps as getAdminApps } from "firebase-admin/app";
 import { getFirestore as getAdminFirestore } from "firebase-admin/firestore";
+import { initializeApp as initClientApp, getApp as getClientApp, getApps as getClientApps } from "firebase/app";
+import { getFirestore as getClientFirestore, doc as clientDoc, getDoc as clientGetDoc, setDoc as clientSetDoc } from "firebase/firestore";
 import pg from "pg";
 import mysql from "mysql2/promise";
 import dns from "dns";
@@ -23,15 +25,64 @@ app.use(express.json());
 // Global database warming flag for serverless environments
 let dbLoaded = false;
 
-// Middleware to pre-warm the SQLite/Firestore cache under Vercel Serverless
+export function getSqlConfigFromEnv() {
+  const dialect = process.env.SQL_DIALECT || process.env.DB_CONNECTION || process.env.DB_DIALECT;
+  let uri = process.env.SQL_CONNECTION_URI || process.env.DATABASE_URL;
+
+  if (!uri && process.env.DB_HOST) {
+    const host = process.env.DB_HOST || "127.0.0.1";
+    const port = process.env.DB_PORT || (dialect === "postgres" ? "5432" : "3306");
+    const user = process.env.DB_USER || process.env.DB_USERNAME || "";
+    const password = process.env.DB_PASSWORD || "";
+    const name = process.env.DB_DATABASE || process.env.DB_NAME || "";
+    
+    if (dialect === "postgres") {
+      uri = `postgres://${user}:${password}@${host}:${port}/${name}`;
+    } else {
+      uri = `mysql://${user}:${password}@${host}:${port}/${name}`;
+    }
+  }
+
+  return {
+    enabled: !!(dialect && uri),
+    dialect: dialect === "postgres" ? "postgres" : ("mysql" as "postgres" | "mysql"),
+    connectionUri: uri || ""
+  };
+}
+
+// Middleware to pre-warm the cache from SQL or Google Cloud Firestore
 app.use(async (req, res, next) => {
-  if (!dbLoaded && process.env.VERCEL) {
+  if (!dbLoaded) {
     try {
-      console.log("Vercel execution context: Prewarming persistent db.json from Firestore...");
-      await loadDbFromFirestore();
+      const sqlEnv = getSqlConfigFromEnv();
+      if (sqlEnv.enabled) {
+        console.log("cPanel/VPS/Local SQL Env detected. Syncing/Prewarming database with connected SQL instance...");
+        try {
+          await createSqlTables(sqlEnv.dialect, sqlEnv.connectionUri);
+          const sqlDb = await syncDatabaseFromSql(sqlEnv.dialect, sqlEnv.connectionUri);
+          if (sqlDb && sqlDb.services && sqlDb.services.length > 0) {
+            fs.writeFileSync(DB_FILE, JSON.stringify(sqlDb, null, 2));
+            console.log("Successfully warmed up database state from SQL DB.");
+          } else {
+            console.log("SQL DB was empty. Seeding SQL database from local default JSON state...");
+            let seedState = DEFAULT_DB;
+            if (fs.existsSync(DB_FILE)) {
+              try {
+                seedState = JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
+              } catch (_) {}
+            }
+            await syncDatabaseToSql(sqlEnv.dialect, sqlEnv.connectionUri, seedState);
+          }
+        } catch (sqlErr) {
+          console.error("Failed to sync from/to connected SQL DB on warmup, falling back to local/Firestore:", sqlErr);
+        }
+      } else if (process.env.VERCEL) {
+        console.log("Vercel execution context: Prewarming persistent db.json from Firestore...");
+        await loadDbFromFirestore();
+      }
       dbLoaded = true;
     } catch (err) {
-      console.error("Failed to load Firestore data in Serverless warmed-up middleware:", err);
+      console.error("Failed database preparation in warmed-up middleware:", err);
     }
   }
   next();
@@ -737,45 +788,87 @@ const DEFAULT_DB = {
   }
 };
 
-// Initialize Firebase Admin SDK for Cloud Firestore synchronization
+// Initialize Firebase Admin or Client SDK (using Client under Vercel for authless persistent Firestore)
 let firestoreDb: any = null;
+let isClientSdk = false;
+let clientDbInstance: any = null;
+
 try {
   const configPath = path.join(process.cwd(), "firebase-applet-config.json");
   if (fs.existsSync(configPath)) {
     const firebaseConfig = JSON.parse(fs.readFileSync(configPath, "utf-8"));
     if (firebaseConfig && firebaseConfig.projectId) {
-      if (!getAdminApps().length) {
-        initAdminApp({
-          projectId: firebaseConfig.projectId,
-        });
-      }
-      if (firebaseConfig.firestoreDatabaseId) {
-        firestoreDb = getAdminFirestore(firebaseConfig.firestoreDatabaseId);
+      if (process.env.VERCEL) {
+        console.log("Vercel context detected. Initializing client-side Firebase SDK for authless persistent Firestore...");
+        const clientApp = getClientApps().length 
+          ? getClientApp() 
+          : initClientApp({
+              apiKey: firebaseConfig.apiKey,
+              authDomain: firebaseConfig.authDomain,
+              projectId: firebaseConfig.projectId,
+              storageBucket: firebaseConfig.storageBucket,
+              messagingSenderId: firebaseConfig.messagingSenderId,
+              appId: firebaseConfig.appId
+            });
+        
+        clientDbInstance = firebaseConfig.firestoreDatabaseId
+          ? getClientFirestore(clientApp, firebaseConfig.firestoreDatabaseId)
+          : getClientFirestore(clientApp);
+        isClientSdk = true;
+        console.log("Client-side Firebase SDK initialized successfully on Vercel.");
       } else {
-        firestoreDb = getAdminFirestore();
+        // Admin SDK setup (for local Cloud Run execution context)
+        if (!getAdminApps().length) {
+          initAdminApp({
+            projectId: firebaseConfig.projectId,
+          });
+        }
+        if (firebaseConfig.firestoreDatabaseId) {
+          firestoreDb = getAdminFirestore(firebaseConfig.firestoreDatabaseId);
+        } else {
+          firestoreDb = getAdminFirestore();
+        }
+        console.log("Firebase Admin SDK initialized successfully for Firestore cloud persistence.");
       }
-      console.log("Firebase Admin SDK initialized successfully for Firestore cloud persistence.");
     }
   }
 } catch (err) {
-  console.error("Failed to initialize Firebase Admin SDK:", err);
+  console.error("Failed to initialize Firebase SDKs:", err);
 }
 
 async function loadDbFromFirestore() {
-  if (!firestoreDb) return null;
   try {
-    const docRef = firestoreDb.collection("app_state").doc("db");
-    const docSnap = await docRef.get();
-    if (docSnap.exists) {
-      const cloudData = docSnap.data();
-      if (cloudData && typeof cloudData === "object" && Object.keys(cloudData).length > 0) {
-        console.log("Successfully loaded database from Cloud Firestore.");
-        fs.writeFileSync(DB_FILE, JSON.stringify(cloudData, null, 2));
-        return cloudData;
+    if (isClientSdk && clientDbInstance) {
+      console.log("Loading database from Cloud Firestore (via Client SDK)...");
+      const docRef = clientDoc(clientDbInstance, "app_state", "db");
+      const docSnap = await clientGetDoc(docRef);
+      if (docSnap.exists()) {
+        const cloudData = docSnap.data();
+        if (cloudData && typeof cloudData === "object" && Object.keys(cloudData).length > 0) {
+          console.log("Successfully loaded database from Cloud Firestore (via Client SDK).");
+          fs.writeFileSync(DB_FILE, JSON.stringify(cloudData, null, 2));
+          return cloudData;
+        }
       }
+      console.log("No database found in Firestore. Seeding with DEFAULT_DB empty cache...");
+      await clientSetDoc(docRef, DEFAULT_DB);
+      fs.writeFileSync(DB_FILE, JSON.stringify(DEFAULT_DB, null, 2));
+      return DEFAULT_DB;
+    } else if (firestoreDb) {
+      console.log("Loading database from Cloud Firestore (via Admin SDK)...");
+      const docRef = firestoreDb.collection("app_state").doc("db");
+      const docSnap = await docRef.get();
+      if (docSnap.exists) {
+        const cloudData = docSnap.data();
+        if (cloudData && typeof cloudData === "object" && Object.keys(cloudData).length > 0) {
+          console.log("Successfully loaded database from Cloud Firestore (via Admin SDK).");
+          fs.writeFileSync(DB_FILE, JSON.stringify(cloudData, null, 2));
+          return cloudData;
+        }
+      }
+      console.log("No database found in Firestore. Seeding Firestore with DEFAULT_DB...");
+      await docRef.set(DEFAULT_DB);
     }
-    console.log("No database found in Firestore. Seeding Firestore with DEFAULT_DB...");
-    await docRef.set(DEFAULT_DB);
   } catch (err) {
     console.error("Failed to load/seed database from Cloud Firestore:", err);
   }
@@ -783,10 +876,16 @@ async function loadDbFromFirestore() {
 }
 
 async function saveDbToFirestore(data: any) {
-  if (!firestoreDb) return;
   try {
-    const docRef = firestoreDb.collection("app_state").doc("db");
-    await docRef.set(data);
+    if (isClientSdk && clientDbInstance) {
+      const docRef = clientDoc(clientDbInstance, "app_state", "db");
+      await clientSetDoc(docRef, data);
+      console.log("Successfully saved database to Cloud Firestore (via Client SDK).");
+    } else if (firestoreDb) {
+      const docRef = firestoreDb.collection("app_state").doc("db");
+      await docRef.set(data);
+      console.log("Successfully saved database to Cloud Firestore (via Admin SDK).");
+    }
   } catch (err) {
     console.error("Failed to save database to Cloud Firestore:", err);
   }
@@ -1487,16 +1586,31 @@ function writeDb(data: any) {
     });
     pendingWrites.push(firestorePromise);
     
-    // Core SQL live replication if configured and enabled
-    if (data && data.settings && data.settings.sqlEnabled && data.settings.sqlConnectionUri) {
-      const sqlPromise = syncDatabaseToSql(data.settings.sqlDialect || "postgres", data.settings.sqlConnectionUri, data)
+    // Live replication to SQL configured via .env variables (e.g. cPanel)
+    const sqlEnv = getSqlConfigFromEnv();
+    if (sqlEnv.enabled) {
+      const sqlEnvPromise = syncDatabaseToSql(sqlEnv.dialect, sqlEnv.connectionUri, data)
         .then(() => {
-          console.log(`Successfully auto-synchronized database update to dynamic SQL DB (${data.settings.sqlDialect})`);
+          console.log(`Successfully auto-synchronized database update to .env SQL DB (${sqlEnv.dialect})`);
         })
         .catch((err) => {
-          console.error(`Live SQL background replication failed:`, err);
+          console.error(`Live .env SQL background replication failed:`, err);
         });
-      pendingWrites.push(sqlPromise);
+      pendingWrites.push(sqlEnvPromise);
+    }
+    
+    // Core SQL live replication if configured and enabled in Admin Settings
+    if (data && data.settings && data.settings.sqlEnabled && data.settings.sqlConnectionUri) {
+      if (!sqlEnv.enabled || sqlEnv.connectionUri !== data.settings.sqlConnectionUri) {
+        const sqlPromise = syncDatabaseToSql(data.settings.sqlDialect || "postgres", data.settings.sqlConnectionUri, data)
+          .then(() => {
+            console.log(`Successfully auto-synchronized database update to dynamic SQL DB (${data.settings.sqlDialect})`);
+          })
+          .catch((err) => {
+            console.error(`Live SQL background replication failed:`, err);
+          });
+        pendingWrites.push(sqlPromise);
+      }
     }
   } catch (err) {
     console.error("Error writing database file:", err);
@@ -1826,6 +1940,390 @@ app.post("/api/admin/sql/sync-from", async (req, res) => {
   }
 });
 
+// Helper function to generate full SQL structure DDL and data seeding insert statements
+function generateSqlDump(dialect: "mysql" | "postgres", data: any): string {
+  let sql = `-- ========================================================\n`;
+  sql += `-- PIXEL AGENCY DYNAMIC DATABASE EXPORT & SEEDING SCRIPT\n`;
+  sql += `-- Dialect: ${dialect.toUpperCase()}\n`;
+  sql += `-- Generated: ${new Date().toISOString()}\n`;
+  sql += `-- ========================================================\n\n`;
+
+  if (dialect === "mysql") {
+    sql += `SET FOREIGN_KEY_CHECKS = 0;\n\n`;
+  } else {
+    sql += `SET CONSTRAINTS ALL DEFERRED;\n\n`;
+  }
+
+  const esc = (val: any) => {
+    if (val === null || val === undefined) return "NULL";
+    if (typeof val === "number") return val;
+    if (typeof val === "boolean") return val ? "1" : "0";
+    if (typeof val === "object") {
+      const str = JSON.stringify(val).replace(/'/g, "''");
+      return `'${str}'`;
+    }
+    const valStr = String(val).replace(/'/g, "''");
+    return `'${valStr}'`;
+  };
+
+  // 1. Settings Table
+  sql += `-- --------------------------------------------------------\n`;
+  sql += `-- Table: sql_settings\n`;
+  sql += `-- --------------------------------------------------------\n`;
+  if (dialect === "mysql") {
+    sql += `DROP TABLE IF EXISTS \`sql_settings\`;\n`;
+    sql += `CREATE TABLE \`sql_settings\` (\n`;
+    sql += `  \`key_name\` varchar(255) NOT NULL,\n`;
+    sql += `  \`val_text\` text,\n`;
+    sql += `  PRIMARY KEY (\`key_name\`)\n`;
+    sql += `) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\n`;
+  } else {
+    sql += `DROP TABLE IF EXISTS sql_settings CASCADE;\n`;
+    sql += `CREATE TABLE sql_settings (\n`;
+    sql += `  key_name VARCHAR(255) PRIMARY KEY,\n`;
+    sql += `  val_text TEXT\n`;
+    sql += `);\n\n`;
+  }
+
+  for (const [key, val] of Object.entries(data.settings || {})) {
+    const valStr = typeof val === "object" ? JSON.stringify(val) : String(val);
+    if (dialect === "mysql") {
+      sql += `INSERT INTO \`sql_settings\` (\`key_name\`, \`val_text\`) VALUES (${esc(key)}, ${esc(valStr)});\n`;
+    } else {
+      sql += `INSERT INTO sql_settings (key_name, val_text) VALUES (${esc(key)}, ${esc(valStr)});\n`;
+    }
+  }
+  sql += `\n`;
+
+  // 2. Services Table
+  sql += `-- --------------------------------------------------------\n`;
+  sql += `-- Table: sql_services\n`;
+  sql += `-- --------------------------------------------------------\n`;
+  if (dialect === "mysql") {
+    sql += `DROP TABLE IF EXISTS \`sql_services\`;\n`;
+    sql += `CREATE TABLE \`sql_services\` (\n`;
+    sql += `  \`id\` varchar(255) NOT NULL,\n`;
+    sql += `  \`title\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`description\` text,\n`;
+    sql += `  \`slug\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`icon\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`features\` text,\n`;
+    sql += `  \`order_index\` int DEFAULT 0,\n`;
+    sql += `  PRIMARY KEY (\`id\`)\n`;
+    sql += `) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\n`;
+  } else {
+    sql += `DROP TABLE IF EXISTS sql_services CASCADE;\n`;
+    sql += `CREATE TABLE sql_services (\n`;
+    sql += `  id VARCHAR(255) PRIMARY KEY,\n`;
+    sql += `  title VARCHAR(255),\n`;
+    sql += `  description TEXT,\n`;
+    sql += `  slug VARCHAR(255),\n`;
+    sql += `  icon VARCHAR(255),\n`;
+    sql += `  features TEXT,\n`;
+    sql += `  order_index INT DEFAULT 0\n`;
+    sql += `);\n\n`;
+  }
+
+  for (const item of data.services || []) {
+    const fStr = typeof item.features === "object" ? JSON.stringify(item.features) : String(item.features || "[]");
+    if (dialect === "mysql") {
+      sql += `INSERT INTO \`sql_services\` (\`id\`, \`title\`, \`description\`, \`slug\`, \`icon\`, \`features\`, \`order_index\`) VALUES (${esc(item.id)}, ${esc(item.title || item.name)}, ${esc(item.description || item.shortDescription)}, ${esc(item.slug)}, ${esc(item.icon)}, ${esc(fStr)}, ${item.orderIndex || 0});\n`;
+    } else {
+      sql += `INSERT INTO sql_services (id, title, description, slug, icon, features, order_index) VALUES (${esc(item.id)}, ${esc(item.title || item.name)}, ${esc(item.description || item.shortDescription)}, ${esc(item.slug)}, ${esc(item.icon)}, ${esc(fStr)}, ${item.orderIndex || 0});\n`;
+    }
+  }
+  sql += `\n`;
+
+  // 3. Packages Table
+  sql += `-- --------------------------------------------------------\n`;
+  sql += `-- Table: sql_packages\n`;
+  sql += `-- --------------------------------------------------------\n`;
+  if (dialect === "mysql") {
+    sql += `DROP TABLE IF EXISTS \`sql_packages\`;\n`;
+    sql += `CREATE TABLE \`sql_packages\` (\n`;
+    sql += `  \`id\` varchar(255) NOT NULL,\n`;
+    sql += `  \`name\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`description\` text,\n`;
+    sql += `  \`price\` decimal(10,2) DEFAULT NULL,\n`;
+    sql += `  \`features\` text,\n`;
+    sql += `  \`service_id\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`enabled\` varchar(50) DEFAULT 'true',\n`;
+    sql += `  PRIMARY KEY (\`id\`)\n`;
+    sql += `) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\n`;
+  } else {
+    sql += `DROP TABLE IF EXISTS sql_packages CASCADE;\n`;
+    sql += `CREATE TABLE sql_packages (\n`;
+    sql += `  id VARCHAR(255) PRIMARY KEY,\n`;
+    sql += `  name VARCHAR(255),\n`;
+    sql += `  description TEXT,\n`;
+    sql += `  price DECIMAL(10,2),\n`;
+    sql += `  features TEXT,\n`;
+    sql += `  service_id VARCHAR(255),\n`;
+    sql += `  enabled VARCHAR(50) DEFAULT 'true'\n`;
+    sql += `);\n\n`;
+  }
+
+  for (const item of data.packages || []) {
+    const fStr = typeof item.features === "object" ? JSON.stringify(item.features) : String(item.features || "[]");
+    if (dialect === "mysql") {
+      sql += `INSERT INTO \`sql_packages\` (\`id\`, \`name\`, \`description\`, \`price\`, \`features\`, \`service_id\`, \`enabled\`) VALUES (${esc(item.id)}, ${esc(item.name)}, ${esc(item.description)}, ${esc(item.price)}, ${esc(fStr)}, ${esc(item.serviceId)}, ${esc(String(item.enabled))});\n`;
+    } else {
+      sql += `INSERT INTO sql_packages (id, name, description, price, features, service_id, enabled) VALUES (${esc(item.id)}, ${esc(item.name)}, ${esc(item.description)}, ${esc(item.price)}, ${esc(fStr)}, ${esc(item.serviceId)}, ${esc(String(item.enabled))});\n`;
+    }
+  }
+  sql += `\n`;
+
+  // 4. Portfolio Table
+  sql += `-- --------------------------------------------------------\n`;
+  sql += `-- Table: sql_portfolio\n`;
+  sql += `-- --------------------------------------------------------\n`;
+  if (dialect === "mysql") {
+    sql += `DROP TABLE IF EXISTS \`sql_portfolio\`;\n`;
+    sql += `CREATE TABLE \`sql_portfolio\` (\n`;
+    sql += `  \`id\` varchar(255) NOT NULL,\n`;
+    sql += `  \`title\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`description\` text,\n`;
+    sql += `  \`category\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`image_url\` text,\n`;
+    sql += `  \`client\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`year\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`live_url\` text,\n`;
+    sql += `  PRIMARY KEY (\`id\`)\n`;
+    sql += `) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\n`;
+  } else {
+    sql += `DROP TABLE IF EXISTS sql_portfolio CASCADE;\n`;
+    sql += `CREATE TABLE sql_portfolio (\n`;
+    sql += `  id VARCHAR(255) PRIMARY KEY,\n`;
+    sql += `  title VARCHAR(255),\n`;
+    sql += `  description TEXT,\n`;
+    sql += `  category VARCHAR(255),\n`;
+    sql += `  image_url TEXT,\n`;
+    sql += `  client VARCHAR(255),\n`;
+    sql += `  year VARCHAR(255),\n`;
+    sql += `  live_url TEXT\n`;
+    sql += `);\n\n`;
+  }
+
+  for (const item of data.portfolio || []) {
+    if (dialect === "mysql") {
+      sql += `INSERT INTO \`sql_portfolio\` (\`id\`, \`title\`, \`description\`, \`category\`, \`image_url\`, \`client\`, \`year\`, \`live_url\`) VALUES (${esc(item.id)}, ${esc(item.title)}, ${esc(item.description)}, ${esc(item.category)}, ${esc(item.imageUrl)}, ${esc(item.client)}, ${esc(item.year)}, ${esc(item.liveUrl)});\n`;
+    } else {
+      sql += `INSERT INTO sql_portfolio (id, title, description, category, image_url, client, year, live_url) VALUES (${esc(item.id)}, ${esc(item.title)}, ${esc(item.description)}, ${esc(item.category)}, ${esc(item.imageUrl)}, ${esc(item.client)}, ${esc(item.year)}, ${esc(item.liveUrl)});\n`;
+    }
+  }
+  sql += `\n`;
+
+  // 5. Testimonials Table
+  sql += `-- --------------------------------------------------------\n`;
+  sql += `-- Table: sql_testimonials\n`;
+  sql += `-- --------------------------------------------------------\n`;
+  if (dialect === "mysql") {
+    sql += `DROP TABLE IF EXISTS \`sql_testimonials\`;\n`;
+    sql += `CREATE TABLE \`sql_testimonials\` (\n`;
+    sql += `  \`id\` varchar(255) NOT NULL,\n`;
+    sql += `  \`client_name\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`client_role\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`company\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`rating\` int DEFAULT 5,\n`;
+    sql += `  \`comment\` text,\n`;
+    sql += `  \`avatar_url\` text,\n`;
+    sql += `  PRIMARY KEY (\`id\`)\n`;
+    sql += `) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\n`;
+  } else {
+    sql += `DROP TABLE IF EXISTS sql_testimonials CASCADE;\n`;
+    sql += `CREATE TABLE sql_testimonials (\n`;
+    sql += `  id VARCHAR(255) PRIMARY KEY,\n`;
+    sql += `  client_name VARCHAR(255),\n`;
+    sql += `  client_role VARCHAR(255),\n`;
+    sql += `  company VARCHAR(255),\n`;
+    sql += `  rating INT DEFAULT 5,\n`;
+    sql += `  comment TEXT,\n`;
+    sql += `  avatar_url TEXT\n`;
+    sql += `);\n\n`;
+  }
+
+  for (const item of data.testimonials || []) {
+    if (dialect === "mysql") {
+      sql += `INSERT INTO \`sql_testimonials\` (\`id\`, \`client_name\`, \`client_role\`, \`company\`, \`rating\`, \`comment\`, \`avatar_url\`) VALUES (${esc(item.id)}, ${esc(item.clientName)}, ${esc(item.clientRole)}, ${esc(item.company)}, ${item.rating || 5}, ${esc(item.comment)}, ${esc(item.avatarUrl)});\n`;
+    } else {
+      sql += `INSERT INTO sql_testimonials (id, client_name, client_role, company, rating, comment, avatar_url) VALUES (${esc(item.id)}, ${esc(item.clientName)}, ${esc(item.clientRole)}, ${esc(item.company)}, ${item.rating || 5}, ${esc(item.comment)}, ${esc(item.avatarUrl)});\n`;
+    }
+  }
+  sql += `\n`;
+
+  // 6. FAQs Table
+  sql += `-- --------------------------------------------------------\n`;
+  sql += `-- Table: sql_faqs\n`;
+  sql += `-- --------------------------------------------------------\n`;
+  if (dialect === "mysql") {
+    sql += `DROP TABLE IF EXISTS \`sql_faqs\`;\n`;
+    sql += `CREATE TABLE \`sql_faqs\` (\n`;
+    sql += `  \`id\` varchar(255) NOT NULL,\n`;
+    sql += `  \`question\` text,\n`;
+    sql += `  \`answer\` text,\n`;
+    sql += `  \`service_id\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  PRIMARY KEY (\`id\`)\n`;
+    sql += `) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\n`;
+  } else {
+    sql += `DROP TABLE IF EXISTS sql_faqs CASCADE;\n`;
+    sql += `CREATE TABLE sql_faqs (\n`;
+    sql += `  id VARCHAR(255) PRIMARY KEY,\n`;
+    sql += `  question TEXT,\n`;
+    sql += `  answer TEXT,\n`;
+    sql += `  service_id VARCHAR(255)\n`;
+    sql += `);\n\n`;
+  }
+
+  for (const item of data.faqs || []) {
+    if (dialect === "mysql") {
+      sql += `INSERT INTO \`sql_faqs\` (\`id\`, \`question\`, \`answer\`, \`service_id\`) VALUES (${esc(item.id)}, ${esc(item.question)}, ${esc(item.answer)}, ${esc(item.serviceId)});\n`;
+    } else {
+      sql += `INSERT INTO sql_faqs (id, question, answer, service_id) VALUES (${esc(item.id)}, ${esc(item.question)}, ${esc(item.answer)}, ${esc(item.serviceId)});\n`;
+    }
+  }
+  sql += `\n`;
+
+  // 7. Orders Table
+  sql += `-- --------------------------------------------------------\n`;
+  sql += `-- Table: sql_orders\n`;
+  sql += `-- --------------------------------------------------------\n`;
+  if (dialect === "mysql") {
+    sql += `DROP TABLE IF EXISTS \`sql_orders\`;\n`;
+    sql += `CREATE TABLE \`sql_orders\` (\n`;
+    sql += `  \`id\` varchar(255) NOT NULL,\n`;
+    sql += `  \`customer_name\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`email\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`phone\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`service_id\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`service_name\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`package_id\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`package_name\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`price\` decimal(10,2) DEFAULT NULL,\n`;
+    sql += `  \`project_details\` text,\n`;
+    sql += `  \`status\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`created_at\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  PRIMARY KEY (\`id\`)\n`;
+    sql += `) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\n`;
+  } else {
+    sql += `DROP TABLE IF EXISTS sql_orders CASCADE;\n`;
+    sql += `CREATE TABLE sql_orders (\n`;
+    sql += `  id VARCHAR(255) PRIMARY KEY,\n`;
+    sql += `  customer_name VARCHAR(255),\n`;
+    sql += `  email VARCHAR(255),\n`;
+    sql += `  phone VARCHAR(255),\n`;
+    sql += `  service_id VARCHAR(255),\n`;
+    sql += `  service_name VARCHAR(255),\n`;
+    sql += `  package_id VARCHAR(255),\n`;
+    sql += `  package_name VARCHAR(255),\n`;
+    sql += `  price DECIMAL(10,2),\n`;
+    sql += `  project_details TEXT,\n`;
+    sql += `  status VARCHAR(255),\n`;
+    sql += `  created_at VARCHAR(255)\n`;
+    sql += `);\n\n`;
+  }
+
+  for (const item of data.orders || []) {
+    if (dialect === "mysql") {
+      sql += `INSERT INTO \`sql_orders\` (\`id\`, \`customer_name\`, \`email\`, \`phone\`, \`service_id\`, \`service_name\`, \`package_id\`, \`package_name\`, \`price\`, \`project_details\`, \`status\`, \`created_at\`) VALUES (${esc(item.id)}, ${esc(item.customerName)}, ${esc(item.email)}, ${esc(item.phone)}, ${esc(item.serviceId)}, ${esc(item.serviceName)}, ${esc(item.packageId)}, ${esc(item.packageName)}, ${esc(item.price)}, ${esc(item.projectDetails)}, ${esc(item.status)}, ${esc(item.createdAt)});\n`;
+    } else {
+      sql += `INSERT INTO sql_orders (id, customer_name, email, phone, service_id, service_name, package_id, package_name, price, project_details, status, created_at) VALUES (${esc(item.id)}, ${esc(item.customerName)}, ${esc(item.email)}, ${esc(item.phone)}, ${esc(item.serviceId)}, ${esc(item.serviceName)}, ${esc(item.packageId)}, ${esc(item.packageName)}, ${esc(item.price)}, ${esc(item.projectDetails)}, ${esc(item.status)}, ${esc(item.createdAt)});\n`;
+    }
+  }
+  sql += `\n`;
+
+  // 8. Contacts Table
+  sql += `-- --------------------------------------------------------\n`;
+  sql += `-- Table: sql_contacts\n`;
+  sql += `-- --------------------------------------------------------\n`;
+  if (dialect === "mysql") {
+    sql += `DROP TABLE IF EXISTS \`sql_contacts\`;\n`;
+    sql += `CREATE TABLE \`sql_contacts\` (\n`;
+    sql += `  \`id\` varchar(255) NOT NULL,\n`;
+    sql += `  \`name\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`email\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`phone\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`message\` text,\n`;
+    sql += `  \`status\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`created_at\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  PRIMARY KEY (\`id\`)\n`;
+    sql += `) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\n`;
+  } else {
+    sql += `DROP TABLE IF EXISTS sql_contacts CASCADE;\n`;
+    sql += `CREATE TABLE sql_contacts (\n`;
+    sql += `  id VARCHAR(255) PRIMARY KEY,\n`;
+    sql += `  name VARCHAR(255),\n`;
+    sql += `  email VARCHAR(255),\n`;
+    sql += `  phone VARCHAR(255),\n`;
+    sql += `  message TEXT,\n`;
+    sql += `  status VARCHAR(255),\n`;
+    sql += `  created_at VARCHAR(255)\n`;
+    sql += `);\n\n`;
+  }
+
+  for (const item of data.contacts || []) {
+    if (dialect === "mysql") {
+      sql += `INSERT INTO \`sql_contacts\` (\`id\`, \`name\`, \`email\`, \`phone\`, \`message\`, \`status\`, \`created_at\`) VALUES (${esc(item.id)}, ${esc(item.name)}, ${esc(item.email)}, ${esc(item.phone)}, ${esc(item.message)}, ${esc(item.status)}, ${esc(item.createdAt)});\n`;
+    } else {
+      sql += `INSERT INTO sql_contacts (id, name, email, phone, message, status, created_at) VALUES (${esc(item.id)}, ${esc(item.name)}, ${esc(item.email)}, ${esc(item.phone)}, ${esc(item.message)}, ${esc(item.status)}, ${esc(item.createdAt)});\n`;
+    }
+  }
+  sql += `\n`;
+
+  // 9. Users Table
+  sql += `-- --------------------------------------------------------\n`;
+  sql += `-- Table: sql_users\n`;
+  sql += `-- --------------------------------------------------------\n`;
+  if (dialect === "mysql") {
+    sql += `DROP TABLE IF EXISTS \`sql_users\`;\n`;
+    sql += `CREATE TABLE \`sql_users\` (\n`;
+    sql += `  \`id\` varchar(255) NOT NULL,\n`;
+    sql += `  \`username\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`password\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  \`role\` varchar(255) DEFAULT NULL,\n`;
+    sql += `  PRIMARY KEY (\`id\`)\n`;
+    sql += `) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n\n`;
+  } else {
+    sql += `DROP TABLE IF EXISTS sql_users CASCADE;\n`;
+    sql += `CREATE TABLE sql_users (\n`;
+    sql += `  id VARCHAR(255) PRIMARY KEY,\n`;
+    sql += `  username VARCHAR(255),\n`;
+    sql += `  password VARCHAR(255),\n`;
+    sql += `  role VARCHAR(255)\n`;
+    sql += `);\n\n`;
+  }
+
+  for (const item of data.users || []) {
+    if (dialect === "mysql") {
+      sql += `INSERT INTO \`sql_users\` (\`id\`, \`username\`, \`password\`, \`role\`) VALUES (${esc(item.id)}, ${esc(item.username)}, ${esc(item.password)}, ${esc(item.role)});\n`;
+    } else {
+      sql += `INSERT INTO sql_users (id, username, password, role) VALUES (${esc(item.id)}, ${esc(item.username)}, ${esc(item.password)}, ${esc(item.role)});\n`;
+    }
+  }
+  sql += `\n`;
+
+  if (dialect === "mysql") {
+    sql += `SET FOREIGN_KEY_CHECKS = 1;\n`;
+  }
+
+  return sql;
+}
+
+// Route to download direct .sql database backup/migration template
+app.get("/api/admin/sql/export-file", (req, res) => {
+  const dialect = (req.query.dialect as "mysql" | "postgres") || "mysql";
+  const db = readDb();
+  
+  try {
+    const dump = generateSqlDump(dialect, db);
+    res.setHeader("Content-Type", "application/sql");
+    res.setHeader("Content-Disposition", `attachment; filename="pixel_agency_${dialect}_backup.sql"`);
+    return res.send(dump);
+  } catch (err: any) {
+    console.error("Failed to generate SQL dump:", err);
+    return res.status(500).json({ error: `Dump failed: ${err.message}` });
+  }
+});
+
 // Manage Services
 app.post("/api/admin/services", (req, res) => {
   const db = readDb();
@@ -2148,9 +2646,33 @@ Current Features: ${(currentFeatures || []).join(", ")}`;
 // Express Server & Dev Environment Setup
 // ------------------------------------
 async function startServer() {
-  // Sync structure with Cloud Firestore at startup
-  console.log("Starting master synchronization with Google Cloud Firestore...");
-  await loadDbFromFirestore();
+  // Sync structure with SQL or Google Cloud Firestore at startup
+  const sqlEnv = getSqlConfigFromEnv();
+  if (sqlEnv.enabled) {
+    console.log("Starting master synchronization with connected SQL Database...");
+    try {
+      await createSqlTables(sqlEnv.dialect, sqlEnv.connectionUri);
+      const sqlDb = await syncDatabaseFromSql(sqlEnv.dialect, sqlEnv.connectionUri);
+      if (sqlDb && sqlDb.services && sqlDb.services.length > 0) {
+        fs.writeFileSync(DB_FILE, JSON.stringify(sqlDb, null, 2));
+        console.log("Successfully master synchronized state from SQL Database.");
+      } else {
+        console.log("SQL DB is empty. Seeding master SQL database from current local disk cache...");
+        let diskData = DEFAULT_DB;
+        if (fs.existsSync(DB_FILE)) {
+          try {
+            diskData = JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
+          } catch (_) {}
+        }
+        await syncDatabaseToSql(sqlEnv.dialect, sqlEnv.connectionUri, diskData);
+      }
+    } catch (sqlErr) {
+      console.error("Failed starting master synchronization with SQL DB, falling back to disk cache:", sqlErr);
+    }
+  } else {
+    console.log("Starting master synchronization with Google Cloud Firestore...");
+    await loadDbFromFirestore();
+  }
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

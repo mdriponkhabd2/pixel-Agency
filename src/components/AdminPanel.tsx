@@ -2317,6 +2317,34 @@ export default function AdminPanel({
                     {sqlTesting ? "Pulling DB..." : "📥 SYNC DATA FROM SQL"}
                   </button>
                 </div>
+
+                {/* cPanel SQL File downloads banner */}
+                <div className="p-3.5 bg-brand/5 border border-brand/20 rounded-xl space-y-2 mt-2 leading-relaxed animate-fade-in text-left">
+                  <h5 className="text-[10px] font-mono font-bold uppercase tracking-widest text-brand block">
+                    ⚡ DIRECT CPANEL & VPS SQL FILE EXPORTS
+                  </h5>
+                  <p className="text-zinc-400 text-[11px] leading-relaxed">
+                    Hosting on cPanel? Simply download the pre-compiled <code className="text-white font-mono px-1 py-0.5 bg-zinc-900 rounded">.sql</code> statements below and import it via <strong>phpMyAdmin</strong>. Once uploaded, supply your database credentials in your <code className="text-white font-mono px-1 py-0.5 bg-zinc-900 rounded">.env</code> variable files (using <code className="text-zinc-300 font-mono text-[10px]">DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE</code>), and your site will run dynamically from SQL!
+                  </p>
+                  <div className="flex flex-wrap gap-2 pt-1">
+                    <a
+                      href="/api/admin/sql/export-file?dialect=mysql"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center space-x-1 py-1.5 px-3 bg-zinc-950 border border-dark-border text-[9px] font-mono uppercase tracking-widest text-brand rounded-lg hover:bg-zinc-900 transition-all cursor-pointer hover:border-brand/40"
+                    >
+                      <span>📥 DOWNLOAD MYSQL WORKSPACE (.SQL)</span>
+                    </a>
+                    <a
+                      href="/api/admin/sql/export-file?dialect=postgres"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center space-x-1 py-1.5 px-3 bg-zinc-950 border border-dark-border text-[9px] font-mono uppercase tracking-widest text-pink-400 rounded-lg hover:bg-zinc-900 transition-all cursor-pointer hover:border-pink-500/40"
+                    >
+                      <span>📥 DOWNLOAD POSTGRES WORKSPACE (.SQL)</span>
+                    </a>
+                  </div>
+                </div>
               </div>
 
               <button
