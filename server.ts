@@ -1449,6 +1449,51 @@ function readDb() {
       db = JSON.parse(data);
     }
 
+    let healed = false;
+    if (!db || typeof db !== "object") {
+      db = JSON.parse(JSON.stringify(DEFAULT_DB));
+      healed = true;
+    }
+
+    // Safety check: if services is missing or empty, populate with default services
+    if (!db.services || !Array.isArray(db.services) || db.services.length === 0) {
+      db.services = JSON.parse(JSON.stringify(DEFAULT_DB.services));
+      healed = true;
+    }
+
+    // Safety check: if packages is missing or empty, populate with default packages
+    if (!db.packages || !Array.isArray(db.packages) || db.packages.length === 0) {
+      db.packages = JSON.parse(JSON.stringify(DEFAULT_DB.packages));
+      healed = true;
+    }
+
+    // Safety check: if testimonials, faqs, portfolio, users, or settings are missing, populate from DEFAULT_DB
+    if (!db.testimonials || !Array.isArray(db.testimonials) || db.testimonials.length === 0) {
+      db.testimonials = JSON.parse(JSON.stringify(DEFAULT_DB.testimonials));
+      healed = true;
+    }
+    if (!db.faqs || !Array.isArray(db.faqs) || db.faqs.length === 0) {
+      db.faqs = JSON.parse(JSON.stringify(DEFAULT_DB.faqs));
+      healed = true;
+    }
+    if (!db.portfolio || !Array.isArray(db.portfolio) || db.portfolio.length === 0) {
+      db.portfolio = JSON.parse(JSON.stringify(DEFAULT_DB.portfolio));
+      healed = true;
+    }
+    if (!db.users || !Array.isArray(db.users) || db.users.length === 0) {
+      db.users = JSON.parse(JSON.stringify(DEFAULT_DB.users));
+      healed = true;
+    }
+    if (!db.settings || typeof db.settings !== "object") {
+      db.settings = JSON.parse(JSON.stringify(DEFAULT_DB.settings));
+      healed = true;
+    }
+
+    if (healed) {
+      console.log("Database state was healed/reseeded. Saving to storage...");
+      writeDb(db);
+    }
+
     if (db && db.services && !db.services.find((s: any) => s.slug === "domain-hosting")) {
       db.services.push({
         id: "domain-hosting",
